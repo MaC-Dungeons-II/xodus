@@ -9,10 +9,18 @@ use xodus::tokens::TokenManager;
 mod commands;
 mod license;
 mod package;
+#[cfg(unix)]
+mod process_status;
 mod webview;
+mod store_purchase;
+mod store_window_check;
 
 #[derive(Subcommand)]
 enum SubCommand {
+    #[command(hide = true)]
+    StorePurchase,
+    /// Display a local, offline Store renderer check.
+    StoreWindowCheck { #[arg(long, default_value="en")] language: String },
     #[command(about = "Download msixvc or xsp files fo given game")]
     Download {
         product: String,
@@ -50,7 +58,13 @@ enum SubCommand {
         #[arg(short, long, help = "Path to a keyfile with content decryption keys")]
         key_file: Option<String>,
     },
-    Login,
+    /// Read authenticated package version metadata without URLs, keys or a download.
+    PackageInfo {
+        product: String,
+        #[arg(short, long)]
+        market: Option<String>,
+    },
+    Login { #[arg(long)] same_account: bool },
     Logout {
         #[arg(long, default_value_t = false, help = "Remove device license")]
         device: bool,
@@ -65,6 +79,17 @@ enum SubCommand {
             help = "Attempt to skip downloading NTFS metadata to be faste while missing some files"
         )]
         try_skip_ntfs: bool,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Resume verified completed files in a private destination; an incomplete file restarts"
+        )]
+        resume_files: bool,
+        #[arg(long, requires = "resume_files")]
+        expect_package: Option<String>,
+        /// Numeric output-payload progress on an inherited nonblocking pipe.
+        #[arg(long, requires = "resume_files")]
+        progress_fd: Option<i32>,
         #[arg(short, long)]
         parallel: Option<usize>,
         #[arg(short, long)]
@@ -145,10 +170,17 @@ async fn main() -> ExitCode {
     }
     let client = reqwest::ClientBuilder::new()
         .user_agent(format!("xodus-cli/{}", env!("CARGO_PKG_VERSION")))
-        .connection_verbose(true)
         .build()
         .unwrap();
     let args = CliArgs::parse();
+
+    if matches!(args.command, SubCommand::StorePurchase) {
+        return store_purchase::run();
+    }
+
+    if let SubCommand::StoreWindowCheck { ref language } = args.command {
+        return store_window_check::run(language);
+    }
 
     xodus::secrets::init_secrets().expect("Unable to initialize credentials");
     let tokens = TokenManager::with_keychain_and_memory();
@@ -164,10 +196,14 @@ async fn main() -> ExitCode {
         SubCommand::Clep { .. } | SubCommand::SpLicense { .. } | SubCommand::Logout { .. }
     );
     if needs_device_credentials {
-        xodus::tokens::device::ensure_device_credentials(&client, &tokens).await;
+        if xodus::tokens::device::ensure_device_credentials(&client, &tokens).await.is_err() {
+            xodus::secrets::destroy_secrets();
+            return std::process::ExitCode::from(71);
+        }
     }
 
     let code = match args.command {
+        SubCommand::StorePurchase | SubCommand::StoreWindowCheck { .. } => unreachable!(),
         SubCommand::Download {
             product,
             market,
@@ -187,7 +223,10 @@ async fn main() -> ExitCode {
             )
             .await
         }
-        SubCommand::Login => commands::login::run(&client, &tokens).await,
+        SubCommand::PackageInfo { product, market } => {
+            commands::package_info::run(&client, &tokens, product, market).await
+        }
+        SubCommand::Login { same_account } => commands::login::run(&client, &tokens, same_account).await,
         SubCommand::Logout { device } => commands::logout::run(&tokens, device).await,
         SubCommand::Extract {
             path,
@@ -212,6 +251,9 @@ async fn main() -> ExitCode {
             source,
             destination,
             try_skip_ntfs,
+            resume_files,
+            expect_package,
+            progress_fd,
             market,
             parallel,
         } => {
@@ -223,6 +265,9 @@ async fn main() -> ExitCode {
                 try_skip_ntfs,
                 parallel,
                 market,
+                resume_files,
+                expect_package,
+                progress_fd,
             )
             .await
         }

@@ -1,5 +1,34 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseStep {
+    Size,
+    Encoding,
+    Envelope,
+    Signature,
+    ChallengeDecryption,
+    ChallengeXml,
+    BodyDecryption,
+    BodyXml,
+    Shape,
+    HttpStatus,
+    RateLimit,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum RSTError {
+    // This context is fixed metadata. Never display the source: parser and
+    // signature errors may contain credentials, URLs or server response text.
+    #[error("Microsoft response processing failed at {step:?}")]
+    Response {
+        step: ResponseStep,
+        #[source]
+        source: Box<RSTError>,
+    },
+    #[error("Microsoft rejected the user credential")]
+    AuthenticationRejected,
+    #[error("Invalid local credential")]
+    InvalidCredential,
+    #[error("Invalid token response")]
+    InvalidResponse,
     #[error("Error making a request {0:?}")]
     Request(#[from] reqwest::Error),
     #[error("Error serializing request {0:?}")]
@@ -19,6 +48,12 @@ pub enum RSTError {
     HmacKey,
     #[error("The signature verification failed - {0}")]
     InvalidResponseSignature(String),
+}
+
+impl RSTError {
+    pub fn at(self, step: ResponseStep) -> Self {
+        Self::Response { step, source: Box::new(self) }
+    }
 }
 
 #[derive(thiserror::Error, Debug)]

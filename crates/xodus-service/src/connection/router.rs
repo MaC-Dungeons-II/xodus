@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
-use xodus::models::secrets::LegacyToken;
 use xodus::tokens::TokenManager;
 
 use crate::simple_context::SimpleContext;
@@ -10,13 +9,12 @@ use crate::simple_context::SimpleContext;
 pub async fn route(
     mut socket: tokio::net::UnixStream,
     token: CancellationToken,
-    device_token: LegacyToken,
     tokens: Arc<TokenManager>,
 ) {
     let cred = socket.peer_cred().ok().and_then(|cred| cred.pid());
     tracing::debug!("Connection from pid {cred:?}");
 
-    let mut context = SimpleContext::new(device_token, tokens);
+    let mut context = SimpleContext::new(tokens);
     loop {
         let mut read_magic = [0; 4];
         if token.is_cancelled() {

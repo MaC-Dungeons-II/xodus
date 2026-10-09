@@ -10,7 +10,33 @@ pub struct MustUnderstandValue {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
-pub struct Fault {}
+pub struct Fault {
+    #[serde(rename = "faultcode", skip_serializing_if = "Option::is_none")]
+    pub fault_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<FaultCode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct FaultCode {
+    pub value: Option<String>,
+    pub subcode: Option<FaultSubcode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub struct FaultSubcode { pub value: Option<String> }
+
+impl Fault {
+    pub fn rejects_credentials(&self) -> bool {
+        let code = self.code.as_ref();
+        [self.fault_code.as_deref(), code.and_then(|c|c.value.as_deref()),
+            code.and_then(|c|c.subcode.as_ref()).and_then(|c|c.value.as_deref())]
+            .into_iter().flatten().any(|value| matches!(value.rsplit(':').next(),
+                Some("FailedAuthentication" | "InvalidSecurityToken")))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Timestamp {
@@ -118,4 +144,20 @@ pub struct PP {
 
     #[serde(rename = "psf:UserSessionKey", alias = "UserSessionKey")]
     pub user_session_key: Option<String>,
+}
+
+impl PP {
+    /// The same Microsoft HTTPS challenge is usable by interactive login and
+    /// reported as requiring sign-in by silent renewal. It is not a credential.
+    pub fn interactive_auth_url(&self) -> Option<&str> {
+        self.inline_auth_url.as_deref().filter(|value| {
+            url::Url::parse(value).is_ok_and(|url| {
+                url.scheme() == "https"
+                    && matches!(url.host_str(), Some("login.live.com" | "account.live.com"))
+                    && url.username().is_empty()
+                    && url.password().is_none()
+                    && url.port_or_known_default() == Some(443)
+            })
+        })
+    }
 }

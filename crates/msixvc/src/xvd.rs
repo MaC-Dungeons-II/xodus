@@ -16,6 +16,7 @@ use tokio::task::block_in_place;
 use tokio::time::{sleep, timeout};
 use tokio_util::io::SyncIoBridge;
 use uuid::Uuid;
+use sha2::{Digest, Sha256};
 use zerocopy::IntoBytes;
 
 use crate::crypt::{TweakGenerator, decrypt_page_xts};
@@ -855,6 +856,7 @@ impl XvdFile {
                 }
                 let chunk = pending.split_to(4096);
                 page.copy_from_slice(&chunk);
+                verify_segment_page(sfile, page_in_section - page_start, &page)?;
                 let to_write_remaining = remaining.min(PAGE_SIZE as u64) as usize;
                 let to_write = if let Some(tweak) = &tweak {
                     let tweak = tweak.with_data_unit(match &s.unwrap().data_units {
@@ -960,6 +962,7 @@ impl XvdFile {
                 sfile.length,
             );
             i.read_exact(&mut page).await?;
+            verify_segment_page(sfile, page_in_section - page_start, &page)?;
             let to_write = min(
                 PAGE_SIZE,
                 sfile.length as usize
@@ -1042,5 +1045,30 @@ impl XvdFile {
     {
         self.extract_file_ex(i, out, sfile, full_key, progress, true)
             .await
+    }
+}
+
+// XVD data hashes cover each full raw 4096-byte page before decryption and are
+// truncated SHA-256 (20 bytes; the following 4 bytes encode the data unit).
+// Existing legacy callers pass no hashes. Resume mode preserves SegmentMetadata
+// hashes so corrupted transfers never acquire a completed-file receipt.
+fn verify_segment_page(file: &SegmentFile, index: u64, page: &[u8; 4096]) -> io::Result<()> {
+    if file.data_hashs.is_empty() { return Ok(()); }
+    if file.offset % 4096 != 0 || file.data_hashs.len() as u64 != file.length.div_ceil(4096) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid segment hash coverage"));
+    }
+    let expected = file.data_hashs.get(index as usize).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,"missing segment hash"))?;
+    if Sha256::digest(page)[..20] != expected[..] { return Err(io::Error::new(io::ErrorKind::InvalidData,"segment data hash mismatch")); }
+    Ok(())
+}
+#[cfg(test)]
+mod resume_hash_tests {
+    use super::*;
+    #[test] fn raw_page_hash_is_required_before_commit() {
+        let page=[42;4096]; let mut hash=[0;20]; hash.copy_from_slice(&Sha256::digest(page)[..20]);
+        let mut f=SegmentFile {offset:4096,length:7,data_hashs:vec![hash],keep_encrypted:true};
+        assert!(verify_segment_page(&f,0,&page).is_ok()); assert!(verify_segment_page(&f,0,&[43;4096]).is_err());
+        assert!(verify_segment_page(&f,1,&page).is_err()); f.length=4097; assert!(verify_segment_page(&f,0,&page).is_err());
+        f.data_hashs.clear(); assert!(verify_segment_page(&f,0,&page).is_ok());
     }
 }

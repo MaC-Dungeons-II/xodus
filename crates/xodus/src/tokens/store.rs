@@ -4,6 +4,14 @@ pub trait TokenBackend: Send + Sync {
     fn get(&self, key: &str) -> Result<Option<Vec<u8>>, TokenStoreError>;
     fn set(&self, key: &str, value: &[u8]) -> Result<(), TokenStoreError>;
     fn remove(&self, key: &str) -> Result<(), TokenStoreError>;
+
+    fn update(
+        &self,
+        key: &str,
+        update: &dyn Fn(Option<Vec<u8>>) -> Result<Vec<u8>, TokenStoreError>,
+    ) -> Result<(), TokenStoreError> {
+        self.set(key, &update(self.get(key)?)?)
+    }
 }
 
 pub trait ExpiringTokenBackend: TokenBackend {

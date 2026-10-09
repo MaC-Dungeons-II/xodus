@@ -1,7 +1,7 @@
 use std::cmp::min;
 use std::collections::HashMap;
 
-use aes::cipher::block_padding::Pkcs7;
+use aes::cipher::block_padding::NoPadding;
 use aes::cipher::{BlockModeDecrypt, KeyIvInit};
 use base64::prelude::*;
 use hmac::{Hmac, KeyInit, Mac};
@@ -101,27 +101,37 @@ pub fn decrypt_soap_encrypted_data<T: serde::de::DeserializeOwned>(
     signature: &rst::RSTSignature,
     nonces: &HashMap<String, String>,
 ) -> Result<T, rst::RSTError> {
-    let id = &encrypted_data
-        .key_info
-        .as_signature()
-        .security_token_reference
+    let id = &encrypted_data.key_info.security_token_reference
+        .as_ref().ok_or(rst::RSTError::MissingNonce)?
         .reference
         .uri;
 
-    let nonce = nonces.get(&id[1..]).ok_or(rst::RSTError::MissingNonce)?;
+    let id = id.strip_prefix('#').filter(|id| !id.is_empty()).ok_or(rst::RSTError::MissingNonce)?;
+    let nonce = nonces.get(id).ok_or(rst::RSTError::MissingNonce)?;
     let nonce = BASE64_STANDARD.decode(nonce)?;
     let key = signature.hmac_key(&nonce).ok_or(rst::RSTError::HmacKey)?;
     let cipher_value = BASE64_STANDARD.decode(encrypted_data.cipher_data.cipher_value)?;
 
+    if encrypted_data.encryption_method.algorithm != "http://www.w3.org/2001/04/xmlenc#aes256-cbc"
+        || cipher_value.len() < 32 || cipher_value.len() > 2 * 1024 * 1024
+        || cipher_value.len() % 16 != 0
+    {
+        return Err(rst::RSTError::InvalidResponse);
+    }
     let (iv, encrypted) = cipher_value.split_at(16);
-    let iv: &[u8; 16] = iv.try_into().unwrap();
+    let iv: &[u8; 16] = iv.try_into().map_err(|_| rst::RSTError::InvalidResponse)?;
     let decryptor = Aes256CbcDec::new(&key.into(), iv.into());
-    let mut block = [0; 8192];
-
-    decryptor
-        .decrypt_padded_b2b::<Pkcs7>(encrypted, &mut block)
-        .expect("Failed");
-    let result = std::str::from_utf8(&block).unwrap();
+    let mut block = vec![0; encrypted.len()];
+    let plaintext = decryptor.decrypt_padded_b2b::<NoPadding>(encrypted, &mut block)
+        .map_err(|_| rst::RSTError::InvalidResponse)?;
+    // XML Encryption CBC padding permits arbitrary bytes followed by the pad
+    // length (W3C XML Encryption 1.1, section 5.2.1), not only PKCS#7 bytes.
+    let padding = usize::from(*plaintext.last().ok_or(rst::RSTError::InvalidResponse)?);
+    if !(1..=16).contains(&padding) || padding > plaintext.len() {
+        return Err(rst::RSTError::InvalidResponse);
+    }
+    let result = std::str::from_utf8(&plaintext[..plaintext.len() - padding])
+        .map_err(|_| rst::RSTError::InvalidResponse)?;
     let data = quick_xml::de::from_str::<T>(result)?;
 
     Ok(data)

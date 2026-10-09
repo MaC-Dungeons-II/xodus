@@ -24,6 +24,7 @@ pub const PASSPORT_STS: &str = "http://Passport.NET/STS";
 pub struct TokenManager {
     persistent: Arc<dyn TokenBackend>,
     ephemeral: Arc<dyn ExpiringTokenBackend>,
+    pub(crate) session_refresh: Arc<tokio::sync::Mutex<super::session::RefreshState>>,
 }
 
 impl TokenManager {
@@ -34,6 +35,7 @@ impl TokenManager {
         Self {
             persistent,
             ephemeral,
+            session_refresh: Default::default(),
         }
     }
 
@@ -110,6 +112,23 @@ impl TokenManager {
             .ok_or(TokenStoreError::NotFound)
     }
 
+    /// Do not overwrite a credential published by another login or refresh.
+    pub(crate) fn replace_user_sts(&self, old: &Token, new: &Token) -> Result<bool, TokenStoreError> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let replaced = AtomicBool::new(false);
+        let expected = serde_json::to_vec(old)?;
+        self.persistent.update(keys::USER_TOKENS, &|bytes| {
+            let bytes = bytes.ok_or(TokenStoreError::NotFound)?;
+            let mut store: TokenStore = serde_json::from_slice(&bytes)?;
+            let current = store.tokens.get(PASSPORT_STS).ok_or(TokenStoreError::NotFound)?;
+            if serde_json::to_vec(current)? != expected { return Ok(bytes); }
+            store.tokens.insert(PASSPORT_STS.into(), new.clone());
+            replaced.store(true, Ordering::Relaxed);
+            Ok(serde_json::to_vec(&store)?)
+        })?;
+        Ok(replaced.load(Ordering::Relaxed))
+    }
+
     // ---- User info -----------------------------------------------------------
 
     pub fn get_user(&self) -> Result<User, TokenStoreError> {
@@ -168,13 +187,15 @@ impl TokenManager {
         address: String,
         token: Token,
     ) -> Result<(), TokenStoreError> {
-        let mut tokens: HashMap<String, Token> = match backend.get(key)? {
-            Some(bytes) if !bytes.is_empty() => {
-                serde_json::from_slice::<TokenStore>(&bytes)?.tokens
-            }
-            _ => HashMap::new(),
-        };
-        tokens.insert(address, token);
-        backend.set(key, &serde_json::to_vec(&TokenStore { tokens })?)
+        backend.update(key, &|bytes| {
+            let mut tokens: HashMap<String, Token> = match bytes {
+                Some(bytes) if !bytes.is_empty() => {
+                    serde_json::from_slice::<TokenStore>(&bytes)?.tokens
+                }
+                _ => HashMap::new(),
+            };
+            tokens.insert(address.clone(), token.clone());
+            Ok(serde_json::to_vec(&TokenStore { tokens })?)
+        })
     }
 }

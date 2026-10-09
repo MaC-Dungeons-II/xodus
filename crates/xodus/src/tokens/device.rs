@@ -1,24 +1,24 @@
 use crate::hardware;
-use crate::licensing::splicense::SPLicense;
-use crate::licensing::utils::{generate_string, parse_bcrypt_rsa_private};
+use crate::licensing::utils::generate_string;
 use crate::models::devicecredential::{Authentication, ClientInfo, DeviceAddRequest, DeviceInfo};
 use crate::models::secrets::Device;
-use crate::models::soap::BodyContent;
+use super::{session::{SessionError, renew_device}, store::TokenStoreError};
 use crate::tokens::manager::TokenManager;
 
 /// Provisions a device (if none is stored yet) or re-authenticates an existing one
 /// (if its STS token is missing/expired), persisting the result through `tokens`.
-pub async fn ensure_device_credentials(client: &reqwest::Client, tokens: &TokenManager) {
+pub async fn ensure_device_credentials(client: &reqwest::Client, tokens: &TokenManager) -> Result<(), SessionError> {
     match tokens.get_device_license() {
-        Err(_) => provision_device(client, tokens).await,
-        Ok(license) if tokens.get_device_sts_token().is_err() => {
-            reauthenticate_device(client, tokens, license).await
+        Err(TokenStoreError::NotFound) => provision_device(client, tokens).await,
+        Err(error) => Err(error.into()),
+        Ok(_) if !device_token_is_current(tokens.get_device_sts_token().ok().as_ref()) => {
+            renew_device(client, tokens).await.map(|_|())
         }
-        Ok(_) => {}
+        Ok(_) => Ok(()),
     }
 }
 
-async fn provision_device(client: &reqwest::Client, tokens: &TokenManager) {
+async fn provision_device(client: &reqwest::Client, tokens: &TokenManager) -> Result<(), SessionError> {
     let username = format!("02{}", generate_string(14));
     let password = generate_string(20);
     let provision = DeviceAddRequest {
@@ -32,8 +32,7 @@ async fn provision_device(client: &reqwest::Client, tokens: &TokenManager) {
     };
 
     let dev = crate::api::live::login_device_credential(client, provision)
-        .await
-        .expect("Failed to get device creds");
+        .await?;
 
     let device = Device {
         username: username.clone(),
@@ -45,43 +44,52 @@ async fn provision_device(client: &reqwest::Client, tokens: &TokenManager) {
     };
 
     tokens
-        .save_device_license(&device)
-        .expect("Failed to save device license");
+        .save_device_license(&device)?;
 
-    reauthenticate_device(client, tokens, device).await;
+    renew_device(client, tokens).await.map(|_|())
 }
 
-async fn reauthenticate_device(client: &reqwest::Client, tokens: &TokenManager, license: Device) {
-    let sp_license =
-        SPLicense::parse_base64(&license.splicense).expect("Failed to parse SPLicense");
-    let clep_sign_state = sp_license.clep_sign_state.expect("Missing clep sign state");
-    let key = clep_sign_state.get_rsa_key();
-    let private_key = parse_bcrypt_rsa_private(&key).unwrap();
-    let resp = crate::api::live::authenticate_device(client, license.username, private_key)
-        .await
-        .expect("Failed to auth device");
-
-    if let BodyContent::RequestSecurityTokenResponse(resp) = resp.body.body {
-        save_device_sts_token(tokens, resp);
+// A persisted credential is not evidence that its STS ticket is still valid.
+// Reuse the device's existing identity/reauthentication path after expiry.
+fn device_token_is_current(token: Option<&crate::models::secrets::Token>) -> bool {
+    let Some(crate::models::secrets::Token::Legacy(token)) = token else {
+        return false;
+    };
+    chrono::DateTime::parse_from_rfc3339(&token.lifetime.expires)
+        .is_ok_and(|expiry| expiry.timestamp() > chrono::Utc::now().timestamp() + 60)
+}
+#[cfg(test)]
+mod resume_expiry_tests {
+    use super::*;
+    #[test]
+    fn device_sts_presence_does_not_hide_expiry() {
+        use crate::models::{
+            secrets::{LegacyToken, Token},
+            soap::Timestamp,
+        };
+        let token = |expires: &str| {
+            Token::Legacy(LegacyToken {
+                key_name: None,
+                token: String::new(),
+                binary_secret: None,
+                tpm_key: None,
+                lifetime: Timestamp {
+                    id: None,
+                    created: String::new(),
+                    expires: expires.into(),
+                },
+            })
+        };
+        assert!(!device_token_is_current(None));
+        assert!(!device_token_is_current(Some(&Token::Compact(
+            "synthetic".into()
+        ))));
+        assert!(!device_token_is_current(Some(&token(
+            "2000-01-01T00:00:00Z"
+        ))));
+        assert!(!device_token_is_current(Some(&token("bad"))));
+        assert!(device_token_is_current(Some(&token(
+            "2999-01-01T00:00:00Z"
+        ))));
     }
-}
-
-fn save_device_sts_token(
-    tokens: &TokenManager,
-    resp: Box<crate::models::soap::RequestSecurityTokenResponse>,
-) {
-    let key_name = resp
-        .requested_security_token
-        .encrypted_data
-        .as_ref()
-        .unwrap()
-        .key_info
-        .key_name
-        .as_ref()
-        .unwrap()
-        .clone();
-    let token = (*resp).into();
-    tokens
-        .save_device_token(key_name, token)
-        .expect("Failed to save device token");
 }

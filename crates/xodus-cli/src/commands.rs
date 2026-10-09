@@ -9,3 +9,5 @@ pub mod logout;
 pub mod run;
 pub mod splicense;
 pub mod streaming;
+
+pub mod package_info;

@@ -11,6 +11,15 @@ use xodus::tokens::TokenManager;
 
 mod connection;
 mod simple_context;
+mod store_account;
+mod store_license;
+mod store_license_token;
+mod store_collections;
+mod store_inventory;
+mod store_package_updates;
+mod store_purchase;
+mod store_health;
+mod store_events;
 mod utils;
 
 const XML_MAGIC: u32 = 0x58445358;
@@ -18,6 +27,10 @@ const PROTO_MAGIC: u32 = 0x58445350;
 
 #[tokio::main]
 async fn main() {
+    let args:Vec<_>=std::env::args_os().skip(1).collect();
+    if args==[std::ffi::OsString::from("--store-check")] { store_health::run().await; return; }
+    if !args.is_empty() { eprintln!("Usage: xodus-service [--store-check]"); std::process::exit(2); }
+    store_events::launch();
     let filter = tracing_subscriber::EnvFilter::from_env("XODUS_LOG");
     let registry =
         tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_filter(filter));
@@ -40,12 +53,10 @@ async fn main() {
 
     xodus::secrets::init_secrets().expect("Failed to init keychain");
     let tokens = Arc::new(TokenManager::with_keychain_and_memory());
-    xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await;
-    let xodus::models::secrets::Token::Legacy(device_token) =
-        tokens.get_device_sts_token().unwrap()
-    else {
-        panic!("Device token isnt legacy")
-    };
+    if xodus::tokens::device::ensure_device_credentials(&reqwest::Client::new(), &tokens).await.is_err() {
+        tracing::error!("Device sign-in unavailable");
+        return;
+    }
 
     let runtime_dir = utils::get_runtime_dir();
     let cancellation = CancellationToken::new();
@@ -70,13 +81,13 @@ async fn main() {
             .expect("Failed to accept");
 
             let token = cancellation.clone();
-            let device_token = device_token.clone();
             let tokens = tokens.clone();
             tokio::spawn(async move {
-                connection::router::route(accept.0, token, device_token, tokens).await
+                connection::router::route(accept.0, token, tokens).await
             });
         }
     }
 
     _ = tokio::fs::remove_file(socket_path).await;
+    xodus::secrets::destroy_secrets();
 }

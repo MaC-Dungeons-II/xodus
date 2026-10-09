@@ -386,6 +386,10 @@ impl EncryptedDeviceKey {
 }
 
 impl ClepSignState {
+    pub fn try_get_rsa_key(&self) -> Option<BCryptRsaBlock> {
+        (self.version == 4).then(|| BCryptRsaBlock(decrypt_cbc_zero_iv(self.key_schedule, &self.key_data)))
+    }
+
     pub fn get_rsa_key(&self) -> BCryptRsaBlock {
         assert!(self.version == 4);
         BCryptRsaBlock(decrypt_cbc_zero_iv(self.key_schedule, &self.key_data))

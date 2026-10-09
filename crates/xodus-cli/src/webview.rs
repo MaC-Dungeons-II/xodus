@@ -4,7 +4,7 @@ use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopWindowT
 use tao::platform::run_return::EventLoopExtRunReturn;
 use tao::window::{Window, WindowBuilder};
 use wry::http::{HeaderMap, HeaderValue};
-use wry::{PageLoadEvent, WebView, WebViewBuilder};
+use wry::{PageLoadEvent, WebContext, WebView, WebViewBuilder};
 use xodus::models::live::{DAProperty, HostBridgeMessage};
 
 type HandlerResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -73,8 +73,11 @@ struct RuntimeState<T: SessionHandler> {
     window: Option<Window>,
     active_session: Option<SessionId>,
     active_webview: Option<WebView>,
+    // Keep the password and follow-up verification in the same browser context.
+    // A new default WebContext for each view discards in-memory session cookies.
+    web_context: WebContext,
     result: Option<T::Output>,
-    error: Option<String>,
+    error: Option<Box<dyn std::error::Error>>,
 }
 
 impl RuntimeCommands {
@@ -163,6 +166,7 @@ where
         window: None,
         active_session: None,
         active_webview: None,
+        web_context: WebContext::default(),
         result: None,
         error: None,
     };
@@ -186,7 +190,7 @@ where
                     session_id,
                     request,
                 ) {
-                    state.error = Some(err.to_string());
+                    state.error = Some(err);
                 }
             }
             Event::UserEvent(CustomEvent::Finish(session_id)) => {
@@ -204,12 +208,18 @@ where
                 }
             }
             Event::UserEvent(CustomEvent::IpcCallback(session_id, data)) => {
-                apply_handler_result(
-                    &proxy,
-                    target,
-                    &mut state,
-                    move |handler, runtime| handler.on_token(session_id, data, runtime),
-                );
+                // Both the page and our post.srf fallback can enqueue a token.
+                // The first callback may already have opened the email-code
+                // challenge; a queued callback from that old view must not
+                // exchange its credential again or terminate the new step.
+                if state.active_session == Some(session_id) {
+                    apply_handler_result(
+                        &proxy,
+                        target,
+                        &mut state,
+                        move |handler, runtime| handler.on_token(session_id, data, runtime),
+                    );
+                }
             }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
@@ -231,7 +241,7 @@ where
     });
 
     if let Some(error) = state.error {
-        return Err(std::io::Error::other(error).into());
+        return Err(error);
     }
 
     Ok(state.result)
@@ -274,7 +284,7 @@ fn apply_handler_result<T, F>(
     match callback(&mut state.handler, &mut commands) {
         Ok(HandlerControl::Continue) => {}
         Ok(HandlerControl::Complete(result)) => state.result = Some(result),
-        Err(err) => state.error = Some(err.to_string()),
+        Err(err) => state.error = Some(err),
     }
 
     state.next_session_id = commands.next_session_id;
@@ -297,7 +307,7 @@ fn apply_actions<T>(
             } => {
                 if let Err(err) = create_session(target, proxy.clone(), state, session_id, request)
                 {
-                    state.error = Some(err.to_string());
+                    state.error = Some(err);
                     break;
                 }
             }
@@ -332,7 +342,7 @@ fn create_session<T: SessionHandler>(
     window.set_title(&request.title);
 
     let proxy_ipc = proxy.clone();
-    let builder = WebViewBuilder::new()
+    let builder = WebViewBuilder::new_with_web_context(&mut state.web_context)
             .with_url(&request.url)
             .with_user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64; MSAppHost/3.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.26100")
             .with_headers(request.headers)
@@ -378,13 +388,18 @@ fn create_session<T: SessionHandler>(
     let webview = {
         use tao::platform::unix::WindowExtUnix;
         use wry::WebViewBuilderExtUnix;
-        builder.build_gtk(window.default_vbox().unwrap()).unwrap()
+        let container = window.default_vbox().ok_or_else(|| {
+            std::io::Error::other("login window has no GTK container")
+        })?;
+        builder.build_gtk(container)?
     };
     #[cfg(not(target_os = "linux"))]
-    let webview = builder.build(&window).unwrap();
+    let webview = builder.build(&window)?;
 
     state.active_session = Some(session_id);
     state.active_webview = Some(webview);
+    window.set_visible(true);
+    window.set_focus();
     Ok(())
 }
 

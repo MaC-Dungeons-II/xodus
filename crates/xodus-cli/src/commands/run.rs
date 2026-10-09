@@ -256,5 +256,5 @@ pub async fn run(
 
     cleanup().await;
 
-    ExitCode::from(status.code().map(|c| c as u8).unwrap_or(0))
+    ExitCode::from(crate::process_status::shell_exit_code(status))
 }

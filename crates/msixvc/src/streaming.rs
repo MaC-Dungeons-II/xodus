@@ -202,7 +202,7 @@ impl<'t> AsyncRead for HttpRead<'t> {
 enum CacheReadState {
     Idle,
     Seeking { offset: u64 },
-    Reading { started_len: usize },
+    Reading,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -210,14 +210,16 @@ enum CacheWriteState {
     Idle,
     Seeking { offset: u64 },
     Writing,
+    Flushing,
+    Failed,
 }
 
-pub struct PrefixCacheFile<R> {
+pub struct PrefixCacheFile<R, W = File> {
     upstream: R,
     len: u64,
     pos: u64,
     cache_reader: File,
-    cache_writer: File,
+    cache_writer: W,
     cached_len: u64,
     pending_seek: Option<u64>,
     pending_chunk: Option<Vec<u8>>,
@@ -247,7 +249,17 @@ where
             .open(cache_path)
             .await?;
         let cache_reader = OpenOptions::new().read(true).open(cache_path).await?;
+        Self::with_cache(upstream, len, cache_reader, cache_writer)
+    }
 
+    /// Accept separate, already safely opened cache handles. The caller owns
+    /// their path policy; both must refer to the same empty regular file.
+    pub fn with_cache(
+        upstream: R,
+        len: u64,
+        cache_reader: File,
+        cache_writer: File,
+    ) -> std::io::Result<Self> {
         Ok(Self {
             upstream,
             len,
@@ -265,6 +277,18 @@ where
         })
     }
 
+    pub async fn sync_cache(&mut self) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.cache_writer.flush().await?;
+        self.cache_writer.sync_all().await
+    }
+}
+
+impl<R, W> PrefixCacheFile<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + AsyncSeek + Unpin,
+{
     pub fn len(&self) -> u64 {
         self.len
     }
@@ -304,9 +328,7 @@ where
                                     "cache seek completed at unexpected position",
                                 )));
                             }
-                            self.cache_read_state = CacheReadState::Reading {
-                                started_len: buf.filled().len(),
-                            };
+                            self.cache_read_state = CacheReadState::Reading;
                         }
                         Poll::Ready(Err(err)) => {
                             self.cache_read_state = CacheReadState::Idle;
@@ -314,11 +336,22 @@ where
                         }
                     }
                 }
-                CacheReadState::Reading { started_len } => {
-                    match AsyncRead::poll_read(Pin::new(&mut self.cache_reader), cx, buf) {
+                CacheReadState::Reading => {
+                    // A cancelled forward read can leave a write flushing while
+                    // a later read seeks backward. Never expose its physically
+                    // written but not yet confirmed suffix through this handle.
+                    let available = self.cached_len.min(self.len) - self.pos;
+                    let limit = available.min(buf.remaining() as u64) as usize;
+                    let mut limited = buf.take(limit);
+                    match AsyncRead::poll_read(Pin::new(&mut self.cache_reader), cx, &mut limited) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Ok(())) => {
-                            let read = buf.filled().len() - started_len;
+                            let read = limited.filled().len();
+                            // AsyncRead guarantees that the filled range is initialized.
+                            unsafe {
+                                buf.assume_init(read);
+                            }
+                            buf.advance(read);
                             self.cache_read_state = CacheReadState::Idle;
                             if read == 0 {
                                 return Poll::Ready(Err(Error::new(
@@ -399,20 +432,40 @@ where
                         }
                         Poll::Ready(Ok(written)) => {
                             self.pending_chunk_offset += written;
-                            self.cached_len += written as u64;
                             self.cache_write_pos += written as u64;
-                            if self.pending_chunk_offset >= chunk.len() {
-                                self.pending_chunk = None;
-                                self.pending_chunk_offset = 0;
-                                self.cache_write_state = CacheWriteState::Idle;
-                            }
-                            return Poll::Ready(Ok(()));
+                            // Tokio File accepts bytes before its blocking write
+                            // completes. Publish no new reader-visible prefix
+                            // until poll_flush confirms the same write finished.
+                            self.cache_write_state = CacheWriteState::Flushing;
                         }
                         Poll::Ready(Err(err)) => {
                             self.cache_write_state = CacheWriteState::Idle;
                             return Poll::Ready(Err(err));
                         }
                     }
+                }
+                CacheWriteState::Flushing => {
+                    match AsyncWrite::poll_flush(Pin::new(&mut self.cache_writer), cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Err(err)) => {
+                            self.cache_write_state = CacheWriteState::Failed;
+                            return Poll::Ready(Err(err));
+                        }
+                        Poll::Ready(Ok(())) => {
+                            self.cached_len = self.cache_write_pos;
+                            if self.pending_chunk_offset >= chunk.len() {
+                                self.pending_chunk = None;
+                                self.pending_chunk_offset = 0;
+                                self.cache_write_state = CacheWriteState::Idle;
+                            } else {
+                                self.cache_write_state = CacheWriteState::Writing;
+                            }
+                            return Poll::Ready(Ok(()));
+                        }
+                    }
+                }
+                CacheWriteState::Failed => {
+                    return Poll::Ready(Err(Error::other("cache write previously failed")));
                 }
             }
         }
@@ -450,9 +503,10 @@ where
     }
 }
 
-impl<R> AsyncRead for PrefixCacheFile<R>
+impl<R, W> AsyncRead for PrefixCacheFile<R, W>
 where
     R: AsyncRead + Unpin,
+    W: AsyncWrite + AsyncSeek + Unpin,
 {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -495,7 +549,7 @@ where
 
             match self.as_mut().poll_flush_pending_chunk(cx) {
                 Poll::Ready(Ok(())) => {
-                    if self.pending_chunk.is_some() {
+                    if self.pending_chunk.is_some() || self.cached_len >= target_end {
                         continue;
                     }
                 }
@@ -518,9 +572,10 @@ where
     }
 }
 
-impl<R> AsyncSeek for PrefixCacheFile<R>
+impl<R, W> AsyncSeek for PrefixCacheFile<R, W>
 where
     R: AsyncRead + Unpin,
+    W: AsyncWrite + AsyncSeek + Unpin,
 {
     fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> std::io::Result<()> {
         let next = match position {
@@ -546,18 +601,27 @@ where
         Ok(())
     }
 
-    fn poll_complete(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<u64>> {
-        let next = self.pending_seek.take().unwrap_or(self.pos);
+    fn poll_complete(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<u64>> {
+        let Some(next) = self.pending_seek else {
+            return Poll::Ready(Ok(self.pos));
+        };
         if next > self.len {
+            self.pending_seek = None;
             return Poll::Ready(Err(Error::new(
                 ErrorKind::InvalidInput,
                 "seek past remote end",
             )));
         }
 
+        // A cancelled read can leave Tokio's file operation in flight. Drain it
+        // before resetting our reader state and starting a different cache seek.
+        match AsyncSeek::poll_complete(Pin::new(&mut self.cache_reader), cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Ready(Ok(_)) => {}
+        }
+        self.cache_read_state = CacheReadState::Idle;
+        self.pending_seek = None;
         self.pos = next;
         Poll::Ready(Ok(self.pos))
     }
@@ -838,6 +902,251 @@ mod tests {
             .unwrap();
         let len = http.len();
         PrefixCacheFile::new(http, len, cache).await.unwrap()
+    }
+
+    // Model Tokio File's accepted-but-not-yet-visible write, while exercising
+    // the production PrefixCacheFile state machine and a real independent reader.
+    struct DelayedWriter {
+        file: std::fs::File,
+        pending: Vec<u8>,
+        ready: Arc<std::sync::atomic::AtomicBool>,
+        fail: bool,
+        physical_before_ready: bool,
+        max_write: usize,
+        writes: usize,
+    }
+
+    impl tokio::io::AsyncWrite for DelayedWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            assert!(self.pending.is_empty());
+            let n = bytes.len().min(self.max_write);
+            self.pending.extend_from_slice(&bytes[..n]);
+            self.writes += 1;
+            std::task::Poll::Ready(Ok(n))
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            if self.fail {
+                return std::task::Poll::Ready(Err(io::Error::other("delayed write failed")));
+            }
+            let ready = self.ready.load(Ordering::SeqCst);
+            if ready || self.physical_before_ready {
+                let pending = std::mem::take(&mut self.pending);
+                std::io::Write::write_all(&mut self.file, &pending)?;
+            }
+            if ready {
+                std::task::Poll::Ready(Ok(()))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    impl tokio::io::AsyncSeek for DelayedWriter {
+        fn start_seek(mut self: std::pin::Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+            assert!(self.pending.is_empty());
+            std::io::Seek::seek(&mut self.file, position)?;
+            Ok(())
+        }
+        fn poll_complete(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<u64>> {
+            std::task::Poll::Ready(std::io::Seek::stream_position(&mut self.file))
+        }
+    }
+
+    async fn delayed_cache(
+        name: &str,
+        body: &[u8],
+        max_write: usize,
+    ) -> (
+        PrefixCacheFile<std::io::Cursor<Vec<u8>>, DelayedWriter>,
+        PathBuf,
+    ) {
+        let path = cache_path(name);
+        let writer = std::fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let reader = tokio::fs::File::open(&path).await.unwrap();
+        (
+            PrefixCacheFile {
+                upstream: std::io::Cursor::new(body.to_vec()),
+                len: body.len() as u64,
+                pos: 0,
+                cache_reader: reader,
+                cache_writer: DelayedWriter {
+                    file: writer,
+                    pending: Vec::new(),
+                    ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    fail: false,
+                    physical_before_ready: false,
+                    max_write,
+                    writes: 0,
+                },
+                cached_len: 0,
+                pending_seek: None,
+                pending_chunk: None,
+                pending_chunk_offset: 0,
+                cache_read_state: super::CacheReadState::Idle,
+                cache_write_state: super::CacheWriteState::Idle,
+                cache_write_pos: 0,
+                upstream_buf: vec![0; super::UPSTREAM_READ_CHUNK_SIZE],
+            },
+            path,
+        )
+    }
+
+    async fn poll_read_once<R, W>(
+        file: &mut PrefixCacheFile<R, W>,
+        bytes: &mut [u8],
+    ) -> std::task::Poll<io::Result<usize>>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + tokio::io::AsyncSeek + Unpin,
+    {
+        use std::future::Future;
+        let mut read = std::pin::pin!(file.read(bytes));
+        std::future::poll_fn(|cx| std::task::Poll::Ready(read.as_mut().poll(cx))).await
+        // The actual Read future and its buffer reference are dropped here.
+    }
+
+    #[tokio::test]
+    async fn cache_visibility_waits_for_delayed_flush() {
+        let (mut file, path) = delayed_cache("delayed-flush", b"complete", usize::MAX).await;
+        let mut bytes = [0; 8];
+        assert!(poll_read_once(&mut file, &mut bytes).await.is_pending());
+        assert_eq!(file.cache_write_pos, 8);
+        assert_eq!(file.cached_len(), 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        assert!(matches!(file.cache_read_state, super::CacheReadState::Idle));
+        file.cache_writer.ready.store(true, Ordering::SeqCst);
+        file.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"complete");
+        assert_eq!(file.cached_len(), 8);
+        assert_eq!(file.cache_writer.writes, 1);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_visibility_failed_flush_never_publishes_on_repoll() {
+        let (mut file, path) = delayed_cache("failed-flush", b"unconfirmed", usize::MAX).await;
+        file.cache_writer.fail = true;
+        let mut bytes = [0; 11];
+        assert!(file.read(&mut bytes).await.is_err());
+        assert_eq!(file.cached_len(), 0);
+        file.cache_writer.fail = false;
+        file.cache_writer.ready.store(true, Ordering::SeqCst);
+        assert!(file.read(&mut bytes).await.is_err());
+        assert_eq!(file.cached_len(), 0);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_visibility_short_writes_finish_before_synchronous_eof() {
+        let body = b"twenty-byte-sequence!";
+        let (mut file, path) = delayed_cache("short-flush", body, 3).await;
+        file.cache_writer.ready.store(true, Ordering::SeqCst);
+        let mut bytes = vec![0; body.len()];
+        file.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(bytes, body);
+        assert_eq!(file.cached_len(), body.len() as u64);
+        assert_eq!(file.cache_writer.writes, body.len().div_ceil(3));
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        assert_eq!(file.read(&mut [0]).await.unwrap(), 0);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cache_visibility_cancelled_flush_backward_seek_exposes_only_confirmed_prefix() {
+        let body = b"twenty-byte-sequence!";
+        let (mut file, path) = delayed_cache("cancel-flush", body, 3).await;
+        file.cache_writer.ready.store(true, Ordering::SeqCst);
+        let mut first = [0; 3];
+        file.read_exact(&mut first).await.unwrap();
+        assert_eq!(first, body[..3]);
+        file.cache_writer.ready.store(false, Ordering::SeqCst);
+        file.cache_writer.physical_before_ready = true;
+        file.seek(SeekFrom::Start(9)).await.unwrap();
+        assert!(poll_read_once(&mut file, &mut [0]).await.is_pending());
+        assert_eq!(file.cached_len(), 3);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 6);
+        file.seek(SeekFrom::Start(0)).await.unwrap();
+        let mut large = [0; 32];
+        assert_eq!(file.read(&mut large).await.unwrap(), 3);
+        assert_eq!(&large[..3], &body[..3]);
+        file.cache_writer.ready.store(true, Ordering::SeqCst);
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail).await.unwrap();
+        assert_eq!(tail, body[3..]);
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cache_visibility_cancelled_reader_drains_before_new_seek() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let body = b"twenty-byte-sequence!";
+                let (mut file, path) = delayed_cache("cancel-reader", body, usize::MAX).await;
+                std::io::Write::write_all(&mut file.cache_writer.file, body).unwrap();
+                file.cached_len = body.len() as u64;
+                file.cache_write_pos = file.cached_len;
+                // Force the production reader into a submitted Tokio blocking read;
+                // cancelling its future must not retain the previous ReadBuf's length.
+                use tokio::io::AsyncRead;
+                file.cache_reader.seek(SeekFrom::Start(8)).await.unwrap();
+                file.pos = 8;
+                file.cache_read_state = super::CacheReadState::Reading;
+                // Occupy the only blocking thread so the next File read must remain
+                // pending, independent of scheduler speed.
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let blocker = tokio::task::spawn_blocking(move || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                });
+                started_rx.recv().unwrap();
+                let mut original = [0; 5];
+                let mut readbuf = tokio::io::ReadBuf::new(&mut original);
+                readbuf.put_slice(b"XX");
+                let first = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(
+                        std::pin::Pin::new(&mut file).poll_read(cx, &mut readbuf),
+                    )
+                })
+                .await;
+                release_tx.send(()).unwrap();
+                assert!(first.is_pending());
+                drop(readbuf);
+                blocker.await.unwrap();
+                file.seek(SeekFrom::Start(1)).await.unwrap();
+                let mut different = [0; 7];
+                file.read_exact(&mut different).await.unwrap();
+                assert_eq!(&different, &body[1..8]);
+                assert_eq!(file.pos, 8);
+                std::fs::remove_file(path).unwrap();
+            });
     }
 
     #[tokio::test]

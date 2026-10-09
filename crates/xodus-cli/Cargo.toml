@@ -5,6 +5,7 @@ edition = "2024"
 default-run = "xodus-cli"
 
 [dependencies]
+sha2 = "0.11.0"
 xodus = { path = "../xodus" }
 msixvc = { path = "../msixvc" }
 eappx = { git = "https://github.com/tuxuser/eappx-rs" }

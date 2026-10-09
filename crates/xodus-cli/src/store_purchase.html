@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'nonce-__NONCE__'; style-src 'unsafe-inline'; frame-src https://www.microsoft.com; form-action https://www.microsoft.com/store/purchase/buynowui/buynow; base-uri 'none'">
+<meta name="referrer" content="same-origin"><title>Microsoft Store</title>
+<style>
+html,body{margin:0;height:100%;background:#171717;color:#fff;font:16px system-ui}
+main{height:100%;display:grid;grid-template-rows:auto minmax(0,1fr) auto}
+header{padding:20px 24px}h1{font-size:20px;margin:0 0 8px}p{margin:0;line-height:1.5;color:#ddd}
+.checkout-area{min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:0 12px}
+iframe{display:block;flex:none;min-height:0;width:100%;max-width:720px;height:100%;max-height:var(--checkout-height,640px);border:0;background:#171717}
+[hidden]{display:none!important}
+button{padding:8px 18px;margin:12px 24px;justify-self:end;border-radius:6px;border:1px solid #aaa;background:#f4f4f4;color:#171717;font:inherit}
+button:focus-visible{outline:3px solid #70c8ff;outline-offset:3px}
+progress{width:100%;margin-top:14px;height:5px}#detail{max-width:58ch}
+main.ready header{padding:12px 24px}main.ready h1{font-size:16px;margin:0}main.ready #detail{display:none}
+main.failed{grid-template-rows:1fr auto}main.failed header{padding-top:48px}
+@media(max-width:480px){header,main.ready header{padding-left:16px;padding-right:16px}.checkout-area{padding:0}button{margin:10px 16px}}
+</style>
+</head><body><main id="main"><header aria-live="polite" role="status"><h1 id="status">Opening Microsoft Store…</h1><p id="detail"></p><progress id="progress" aria-label="Loading"></progress></header>
+<div class="checkout-area" id="checkout-area">
+<iframe id="checkout" name="microsoft-checkout" title="Microsoft Store payment confirmation" allow="payment *" sandbox="allow-forms allow-scripts allow-same-origin allow-popups"></iframe>
+</div>
+<button id="cancel" type="button">Cancel</button></main>
+<script nonce="__NONCE__">
+(() => {
+  'use strict';
+  const config = __CONFIG__;
+  const nonce = '__NONCE__';
+  const mode = '__MODE__';
+  const de = config.locale.toLowerCase().startsWith('de');
+  document.documentElement.lang = de ? 'de' : 'en';
+  const text = (en, german) => de ? german : en;
+  const frame = document.getElementById('checkout');
+  const heading = document.getElementById('status');
+  const detail = document.getElementById('detail');
+  const button = document.getElementById('cancel');
+  const progress = document.getElementById('progress');
+  let finished = false, ready = false, failure = null;
+  let loadTimer, expiryTimer, sessionTimer;
+  const emit = value => window.ipc.postMessage(JSON.stringify({nonce, ...value}));
+  const phase = stage => emit({phase:stage});
+  const clear = () => { clearTimeout(loadTimer); clearTimeout(expiryTimer); clearTimeout(sessionTimer); };
+  const finish = (status, orderId) => {
+    if (finished) return;
+    finished = true; clear();
+    emit({status:failure || status, orderId});
+  };
+  const fail = reason => {
+    if (finished || failure) return;
+    failure = reason; clear(); phase(reason);
+    frame.hidden = true; frame.removeAttribute('src'); frame.src = 'about:blank';
+    document.getElementById('checkout-area').hidden = true;
+    progress.hidden = true; document.getElementById('main').classList.remove('ready'); document.getElementById('main').classList.add('failed');
+    heading.textContent = text('Microsoft Store could not continue', 'Microsoft Store konnte nicht fortfahren');
+    const messages = {
+      bootstrap_error: text('The connection to Microsoft Store could not be established. Close this window and check your connection before trying again.', 'Die Verbindung zum Microsoft Store konnte nicht hergestellt werden. Schließe dieses Fenster und prüfe vor einem erneuten Versuch deine Verbindung.'),
+      load_timeout: text('The confirmation page did not respond within 45 seconds. Close this window, check your connection and run the Store check in Flightdeck.', 'Die Bestätigungsseite hat innerhalb von 45 Sekunden nicht geantwortet. Schließe dieses Fenster, prüfe deine Verbindung und starte die Store-Prüfung in Flightdeck.'),
+      session_timeout: text('This window has been open for 15 minutes. Close it and check your Microsoft order history before trying again.', 'Dieses Fenster ist seit 15 Minuten geöffnet. Schließe es und prüfe vor einem erneuten Versuch deinen Microsoft-Bestellverlauf.'),
+      expired: text('This sign-in session has expired. Close the game and sign in again in Flightdeck.', 'Diese Anmeldung ist abgelaufen. Schließe das Spiel und melde dich in Flightdeck erneut an.'),
+      error: text('Microsoft did not return a valid confirmation. Close this window and check your Microsoft order history before trying again.', 'Microsoft hat keine gültige Bestätigung zurückgegeben. Schließe dieses Fenster und prüfe vor einem erneuten Versuch deinen Microsoft-Bestellverlauf.'),
+    };
+    detail.textContent = messages[reason]; button.textContent = text('Close', 'Schließen'); button.focus();
+  };
+  heading.textContent = text('Opening Microsoft Store…', 'Microsoft Store wird geöffnet …');
+  detail.textContent = text('Waiting for Microsoft’s confirmation page. Loading can take a moment.', 'Die Bestätigungsseite von Microsoft wird geladen. Das kann einen Moment dauern.');
+  button.textContent = text('Cancel', 'Abbrechen');
+  button.onclick = () => finish('cancel');
+  window.addEventListener('message', event => {
+    if (event.origin !== 'https://www.microsoft.com' || event.source !== frame.contentWindow || finished || failure) return;
+    const data = event.data;
+    if (data === 'ReactPurchaseReadyToRender' || (data && data.message === 'stageChanged' && data.stage === 'ready')) {
+      if (!ready) { ready = true; clearTimeout(loadTimer); phase('checkout_ready'); }
+      document.getElementById('main').classList.add('ready');
+      heading.textContent = 'Microsoft Store'; progress.hidden = true;
+      detail.textContent = text('Review the details on Microsoft’s page. You can close this window at any time.', 'Prüfe die Angaben auf der Microsoft-Seite. Du kannst dieses Fenster jederzeit schließen.');
+    } else if (data && data.message === 'sizeChanged' && typeof data.height === 'number'
+        && Number.isFinite(data.height) && data.height >= 240 && data.height <= 4096) {
+      // Microsoft's hosted layout can change height for payment-method and
+      // confirmation views. Keep its viewport inside the available window.
+      frame.style.setProperty('--checkout-height', Math.ceil(data.height) + 'px');
+    } else if (data && data.message === 'openUrl' && typeof data.url === 'string') {
+      try { const url = new URL(data.url); if (url.protocol === 'https:' && !url.username && !url.password) window.open(url.href, '_blank'); } catch (_) {}
+    } else if (data && typeof data === 'object' && data.message === 'done') {
+      if (data.status === 'success' && typeof data.orderId === 'string' && /^[A-Za-z0-9_:-]{1,128}$/.test(data.orderId)) finish('success', data.orderId);
+      else if (['cancel', 'cancelXButton', 'cancelEscKey'].includes(data.status)) finish(data.status);
+      else if (['success', 'error'].includes(data.status)) fail('error');
+    }
+  });
+  // The native host first navigates to Microsoft's public prefetch document.
+  // A form posted directly from about:blank has Origin: null and is rejected.
+  // Keep the opening view visible while that navigation is pending. No token
+  // or product is sent to the prefetch document.
+  if (mode === 'bootstrap') { phase('bootstrap_started'); return; }
+  phase('window_ready');
+  if (mode === 'bootstrap_error' || location.origin !== 'https://www.microsoft.com') { fail('bootstrap_error'); return; }
+  if (config.expiresAt * 1000 <= Date.now() + 5000) { fail('expired'); return; }
+  // These timers do not retry a request or submit a payment.
+  loadTimer = setTimeout(() => fail('load_timeout'), 45000);
+  expiryTimer = setTimeout(() => fail('expired'), Math.max(0, Math.min(2147483647, config.expiresAt * 1000 - Date.now() - 5000)));
+  sessionTimer = setTimeout(() => fail('session_timeout'), 900000);
+  const form = document.createElement('form');
+  const url = new URL('https://www.microsoft.com/store/purchase/buynowui/buynow');
+  url.search = new URLSearchParams({market:config.market, locale:config.locale, clientName:'XboxCom', noCanonical:'true'});
+  form.action = url.href; form.method = 'post'; form.target = frame.name;
+  const fields = {data:JSON.stringify({usePurchaseSdk:true}), market:config.market, locale:config.locale,
+    cV:btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)))).replace(/=+$/,'')+'.0',
+    xToken:config.xToken, products:JSON.stringify([{productId:config.productId, skuId:config.skuId, availabilityId:config.availabilityId}]),
+    clientType:'XboxCom', layout:'Modal', pageFormat:'full', theme:'dark', deviceFamily:'Windows.Desktop',
+    cssOverride:'XboxCom2NewUI', 'flights[0]':'sc_disabledefaultstyles'};
+  for (const [name,value] of Object.entries(fields)) {
+    const input = document.createElement('input'); input.type='hidden'; input.name=name; input.value=value; form.appendChild(input);
+  }
+  document.body.appendChild(form);
+  form.submit(); // Opens Microsoft's confirmation page; never submits a payment.
+  form.remove();
+})();
+</script></body></html>

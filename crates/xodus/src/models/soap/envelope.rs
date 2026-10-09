@@ -8,6 +8,32 @@ use super::tokens::{
     RequestSecurityTokenResponseCollection,
 };
 
+// Response headers differ from the headers we send. In particular, Microsoft
+// can return a plain SOAP fault containing only PP and its inline challenge.
+// Keep request construction strict, and validate successful response headers
+// separately before accepting any tokens.
+#[derive(Debug, Deserialize)]
+pub struct ResponseEnvelope {
+    #[serde(rename = "Header", default)]
+    pub header: ResponseHeader,
+    #[serde(rename = "Body")]
+    pub body: Body,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ResponseHeader {
+    #[serde(rename = "Action")]
+    pub action: Option<MustUnderstandValue>,
+    #[serde(rename = "To")]
+    pub to: Option<MustUnderstandValue>,
+    #[serde(rename = "Security")]
+    pub security: Option<Security>,
+    #[serde(rename = "EncryptedPP")]
+    pub encrypted_pp: Option<EncryptedPP>,
+    #[serde(rename = "pp")]
+    pub pp: Option<PP>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename = "s:Envelope")]
 pub struct Envelope {
