@@ -69,6 +69,20 @@ enum SubCommand {
         #[arg(long, default_value_t = false, help = "Remove device license")]
         device: bool,
     },
+    #[command(about = "Write/keep the mcd2 adapter Xbox session file from the xodus account")]
+    MacSession {
+        home: String,
+        #[arg(long, default_value_t = false)]
+        serve: bool,
+    },
+    #[command(about = "Download the full package without prompts and extract it (M(a)C Dungeons II launcher)")]
+    MacFetch {
+        product: String,
+        workdir: String,
+        destination: String,
+        #[arg(short, long)]
+        market: Option<String>,
+    },
     #[command(about = "Download and extract the game through streaming algorithm")]
     Streaming {
         source: String,
@@ -104,6 +118,9 @@ enum SubCommand {
         exe: Option<String>,
         #[arg(short, long)]
         market: Option<String>,
+        /// Extra arguments passed to the game executable (after --)
+        #[arg(last = true)]
+        game_args: Vec<String>,
     },
     #[command(about = "Generate or decrypt base64-encoded CLEP challenge data")]
     Clep {
@@ -204,6 +221,10 @@ async fn main() -> ExitCode {
 
     let code = match args.command {
         SubCommand::StorePurchase | SubCommand::StoreWindowCheck { .. } => unreachable!(),
+        SubCommand::MacSession { home, serve } => commands::mac_session::run(&client, &tokens, home, serve).await,
+        SubCommand::MacFetch { product, workdir, destination, market } => {
+            commands::mac_fetch::run(&client, &tokens, product, workdir, destination, market).await
+        }
         SubCommand::Download {
             product,
             market,
@@ -277,7 +298,8 @@ async fn main() -> ExitCode {
             wine,
             exe,
             market,
-        } => commands::run::run(&client, &tokens, source, wine, exe, market).await,
+            game_args,
+        } => commands::run::run(&client, &tokens, source, wine, exe, market, game_args).await,
         SubCommand::Clep { action } => match action {
             ClepAction::Generate {
                 smbios,

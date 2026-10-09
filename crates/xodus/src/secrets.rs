@@ -1,4 +1,4 @@
-pub static SERVICE_NAME: &str = "Xodus Service";
+pub static SERVICE_NAME: &str = "M(a)C Dungeons II";
 
 #[cfg(feature = "key-chain-file")]
 mod file;

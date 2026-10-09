@@ -237,7 +237,14 @@ where
         total_progess.set_message("Initializing");
         let mut bars: HashMap<usize, ProgressBar> = HashMap::new();
 
+        // M(a)C Dungeons II launcher: machine-readable extraction progress.
+        let json_progress = std::env::var_os("MACD2_PROGRESS_JSON").is_some();
+        let mut last_json = std::time::Instant::now();
         while let Some(event) = rx.recv().await {
+            if json_progress && last_json.elapsed() >= std::time::Duration::from_millis(500) {
+                last_json = std::time::Instant::now();
+                println!("{}", serde_json::json!({"phase": "extract", "done": total_progess.position(), "total": total_progess.length().unwrap_or(0)}));
+            }
             match event {
                 ProgressEvent::Started { id, name, total } => {
                     let cur_progess = multi_progress.add(ProgressBar::new(total).with_style(

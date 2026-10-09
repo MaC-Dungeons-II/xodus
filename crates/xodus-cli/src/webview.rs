@@ -147,11 +147,11 @@ pub fn login_request(client_id: String, market: String) -> WebviewRequest {
         HeaderValue::from_static(r#"CloudExperienceHost"#),
     );
 
-    WebviewRequest::new("Xodus login", url, headers)
+    WebviewRequest::new("M(a)C Dungeons II · Microsoft 로그인", url, headers)
 }
 
 pub fn finalize_request(url: String) -> WebviewRequest {
-    WebviewRequest::new("Xodus login", url, HeaderMap::new())
+    WebviewRequest::new("M(a)C Dungeons II · Microsoft 로그인", url, HeaderMap::new())
 }
 
 pub fn run_sessions<T>(handler: T) -> HandlerResult<Option<T::Output>>

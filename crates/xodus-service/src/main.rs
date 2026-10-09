@@ -60,7 +60,9 @@ async fn main() {
 
     let runtime_dir = utils::get_runtime_dir();
     let cancellation = CancellationToken::new();
-    let socket_path = format!("{runtime_dir}/xodus.sock");
+    // M(a)C Dungeons II: private socket name (the game side sets XODUS_USER_SOCKET_SUFFIX to match).
+    let socket_name = std::env::var("MACD2_SOCKET").unwrap_or_else(|_| "macd2.sock".to_string());
+    let socket_path = format!("{runtime_dir}/{socket_name}");
     let trigger = cancellation.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c()

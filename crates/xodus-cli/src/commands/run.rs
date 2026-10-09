@@ -119,6 +119,7 @@ pub async fn run(
     wine: String,
     exe: Option<String>,
     market: Option<String>,
+    game_args: Vec<String>,
 ) -> ExitCode {
     let mut lfiles: HashMap<String, SegmentFile> = HashMap::new();
 
@@ -185,6 +186,73 @@ pub async fn run(
 
     let (cleanup, mount_dir) = prepare(&lfiles).await;
 
+    // M(a)C Dungeons II: on macOS, build a game view inside the RAM disk where
+    // encrypted executables are real decrypted files and everything else is a
+    // symlink to the installation. Titles that re-read their own image from
+    // disk (integrity checks) then see the same plaintext Windows' package view
+    // provides. Decrypted bytes only ever live on the RAM disk.
+    if cfg!(target_os = "macos") && std::env::var_os("MACD2_VIEW").is_some() {
+        let view = Path::new(&mount_dir).join("view");
+        let mut encrypted = std::collections::HashSet::new();
+        for file in &lfiles {
+            if !file.1.keep_encrypted {
+                continue;
+            }
+            let rel = file.0.trim_start_matches('\\').replace('\\', "/");
+            encrypted.insert(rel.to_ascii_lowercase());
+            let dest = view.join(&rel);
+            std::fs::create_dir_all(dest.parent().unwrap()).expect("view dir");
+            let mut out = File::from_std(std::fs::File::create(&dest).expect("view file"));
+            let mut i = File::open(out_absolute.join(&rel)).await.unwrap();
+            xvd.mount_mem_fd(&mut i, &mut out, file.1, *full_key, |_, _| {}).await.unwrap();
+        }
+        fn mirror(src: &Path, dst: &Path, root: &Path, skip: &std::collections::HashSet<String>) {
+            let Ok(entries) = std::fs::read_dir(src) else { return };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name.to_string_lossy().starts_with(".xodus") {
+                    continue;
+                }
+                let path = entry.path();
+                let target = dst.join(&name);
+                let rel = path.strip_prefix(root).unwrap().to_string_lossy().to_ascii_lowercase();
+                if path.is_dir() {
+                    if skip.iter().any(|s| s.starts_with(&format!("{rel}/"))) {
+                        std::fs::create_dir_all(&target).ok();
+                        mirror(&path, &target, root, skip);
+                    } else if !target.exists() {
+                        std::os::unix::fs::symlink(&path, &target).ok();
+                    }
+                } else if !skip.contains(&rel) && !target.exists() {
+                    std::os::unix::fs::symlink(&path, &target).ok();
+                }
+            }
+        }
+        std::fs::create_dir_all(&view).ok();
+        mirror(&out_absolute, &view, &out_absolute, &encrypted);
+        let entry_rel = exe
+            .as_deref()
+            .map(|e| e.trim_start_matches(['\\', '/']).replace('\\', "/"))
+            .unwrap_or_default();
+        let entry = view.join(&entry_rel);
+        let mut wn = Command::new(wine)
+            .arg(&entry)
+            .args(&game_args)
+            .current_dir(entry.parent().unwrap_or(&view))
+            .spawn()
+            .unwrap();
+        let pid = wn.id().unwrap();
+        ctrlc::set_handler(move || {
+            if pid > 0 {
+                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGINT);
+            }
+        })
+        .expect("failed to install Ctrl+C handler");
+        let status = wn.wait().await.unwrap();
+        cleanup().await;
+        return ExitCode::from(crate::process_status::shell_exit_code(status));
+    }
+
     for file in &lfiles {
         if !file.1.keep_encrypted {
             continue;
@@ -222,7 +290,8 @@ pub async fn run(
         let nt_suffix = fd.0.trim_start_matches('\\');
         let nt_path = format!("\\??\\Z:{}\\{}", nt_prefix, nt_suffix);
         if let Some(exe) = &exe {
-            if exe == fd.0 {
+            let norm = |s: &str| s.trim_start_matches(['\\', '/']).replace('/', "\\").to_ascii_lowercase();
+            if norm(exe) == norm(fd.0) {
                 nt_entry = Some(nt_path)
             }
         } else if nt_entry.is_none() {
@@ -239,6 +308,7 @@ pub async fn run(
 
     let mut wn = Command::new(wine)
         .arg(nt_entry)
+        .args(&game_args)
         .env("WINE_DLL_FILE_MAP", env_value)
         .spawn()
         .unwrap();

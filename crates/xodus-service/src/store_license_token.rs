@@ -138,6 +138,9 @@ async fn acquire(request: &Request, tokens: &TokenManager) -> Result<Receipt, St
         let verified = verified_token::verify(&client, &token, &request.custom_developer_string).await
             .map_err(|stage| { tracing::warn!(stage, "Store receipt verification failed"); Status::Error })?;
         let now = chrono::Utc::now().timestamp();
+        // Diagnostics: catalogue IDs and grant state only (no token, account or nonce).
+        let granted: Vec<String> = verified.products.iter().map(|p| format!("{}/{} active={}", p.product_id, p.sku_id, p.ends_at > now)).collect();
+        eprintln!("store-license-token: store_id={} requested={:?} granted={:?}", request.store_id, request.product_ids, granted);
         let result = receipt(token, &verified, request, now)?;
         // Downloads can race the service's license renewal. Repeat the real
         // read for explicitly requested products with only expired grants.
