@@ -24,6 +24,11 @@ const RELYING_PARTIES: [&str; 3] = [
     "http://playfab.xboxlive.com/",
 ];
 const PACKET_SIZE: usize = 8 * 3 + 4 * 2 + 32 + 512 + 49152 + 8;
+/// FILETIME (100 ns ticks since 1601-01-01) of the Unix epoch.
+const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+const FILETIME_TICKS_PER_SEC: u64 = 10_000_000;
+/// Exit code that tells the launcher an interactive login is needed.
+const EXIT_LOGIN_REQUIRED: u8 = 77;
 
 struct Session {
     packet: Vec<u8>,
@@ -31,8 +36,16 @@ struct Session {
     generation: u64,
 }
 
-fn now_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+fn since_epoch() -> Duration {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
+}
+
+fn now_secs() -> i64 {
+    since_epoch().as_secs() as i64
+}
+
+fn read_u64(data: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap())
 }
 
 fn field(out: &mut Vec<u8>, value: &str, size: usize) -> Result<(), &'static str> {
@@ -80,8 +93,7 @@ async fn mint(client: &reqwest::Client, tokens: &TokenManager) -> Result<Session
     if xuids.len() != 1 || xuid == 0 {
         return Err("identity");
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    if expires <= now + 120 {
+    if expires <= now_secs() + 120 {
         return Err("expiring");
     }
     let age: u32 = match claims.get("agg").map(String::as_str) {
@@ -90,25 +102,24 @@ async fn mint(client: &reqwest::Client, tokens: &TokenManager) -> Result<Session
         Some("Adult") => 3,
         _ => 0,
     };
-    let mut bits = [0u8; 32];
-    let known = claims.get("prv").map(|p| {
-        for item in p.split_whitespace() {
-            if let Ok(v) = item.parse::<usize>() {
-                if v < 256 {
-                    bits[v / 8] |= 1 << (v % 8);
-                }
+    let mut privileges = [0u8; 32];
+    let privileges_known = claims.get("prv").is_some();
+    if let Some(prv) = claims.get("prv") {
+        for v in prv.split_whitespace().filter_map(|item| item.parse::<usize>().ok()) {
+            if v < 256 {
+                privileges[v / 8] |= 1 << (v % 8);
             }
         }
-    });
-    let generation = now_ns();
+    }
+    let generation = since_epoch().as_nanos() as u64;
     let mut packet = Vec::with_capacity(PACKET_SIZE);
     packet.extend_from_slice(&MAGIC.to_le_bytes());
-    let filetime = (expires as u64) * 10_000_000 + 116_444_736_000_000_000;
+    let filetime = (expires as u64) * FILETIME_TICKS_PER_SEC + FILETIME_UNIX_EPOCH;
     packet.extend_from_slice(&filetime.to_le_bytes());
     packet.extend_from_slice(&xuid.to_le_bytes());
     packet.extend_from_slice(&age.to_le_bytes());
-    packet.extend_from_slice(&(known.is_some() as u32).to_le_bytes());
-    packet.extend_from_slice(&bits);
+    packet.extend_from_slice(&(privileges_known as u32).to_le_bytes());
+    packet.extend_from_slice(&privileges);
     field(&mut packet, claims.get("gtg").map(String::as_str).unwrap_or(""), 128)?;
     for _ in 0..3 {
         field(&mut packet, "", 128)?;
@@ -131,14 +142,15 @@ fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-fn current_generation(path: &Path) -> Option<(u64, i64)> {
+/// Generation and expiry (Unix seconds) of a valid session file, if any.
+fn read_session(path: &Path) -> Option<(u64, i64)> {
     let data = std::fs::read(path).ok()?;
-    if data.len() != PACKET_SIZE || u64::from_le_bytes(data[0..8].try_into().ok()?) != MAGIC {
+    if data.len() != PACKET_SIZE || read_u64(&data, 0) != MAGIC {
         return None;
     }
-    let filetime = u64::from_le_bytes(data[8..16].try_into().ok()?);
-    let expires = ((filetime.saturating_sub(116_444_736_000_000_000)) / 10_000_000) as i64;
-    let generation = u64::from_le_bytes(data[PACKET_SIZE - 8..].try_into().ok()?);
+    let filetime = read_u64(&data, 8);
+    let expires = (filetime.saturating_sub(FILETIME_UNIX_EPOCH) / FILETIME_TICKS_PER_SEC) as i64;
+    let generation = read_u64(&data, PACKET_SIZE - 8);
     Some((generation, expires))
 }
 
@@ -161,17 +173,15 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager, home: String, 
                     Some(s.generation)
                 }
                 Err(stage) => {
-                    // Exit code 77 tells the launcher an interactive login is needed.
                     println!("{}", serde_json::json!({"session": "failed", "stage": stage}));
                     None
                 }
             }
         }
     };
-    let now = || SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    let needs = current_generation(&session_path).map(|(_, e)| e < now() + 600).unwrap_or(true);
-    if needs && renew("start").await.is_none() {
-        return ExitCode::from(77);
+    let needs_renewal = read_session(&session_path).is_none_or(|(_, e)| e < now_secs() + 600);
+    if needs_renewal && renew("start").await.is_none() {
+        return ExitCode::from(EXIT_LOGIN_REQUIRED);
     }
     if !serve {
         return ExitCode::SUCCESS;
@@ -181,7 +191,7 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager, home: String, 
         // Adapter-forced refresh requests: refresh-<16 hex>.req -> .res
         if let Ok(entries) = std::fs::read_dir(&home) {
             for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
+                let name = entry.file_name().to_string_lossy().into_owned();
                 let Some(stem) = name.strip_suffix(".req") else { continue };
                 if !stem.starts_with("refresh-") || stem.len() != 24 || !stem[8..].bytes().all(|c| c.is_ascii_hexdigit()) {
                     continue;
@@ -190,14 +200,13 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager, home: String, 
                 let mut code = ERROR;
                 let mut generation = 0u64;
                 if let Ok(data) = std::fs::read(&path) {
-                    if data.len() == 16 && u64::from_le_bytes(data[0..8].try_into().unwrap()) == REQUEST_MAGIC {
-                        let old = u64::from_le_bytes(data[8..16].try_into().unwrap());
-                        let current = current_generation(&session_path);
-                        if current.map(|(g, _)| g == old).unwrap_or(true) {
+                    if data.len() == 16 && read_u64(&data, 0) == REQUEST_MAGIC {
+                        let old = read_u64(&data, 8);
+                        if read_session(&session_path).is_none_or(|(g, _)| g == old) {
                             renew("forced").await;
                         }
-                        if let Some((g, e)) = current_generation(&session_path) {
-                            if g != old && e > now() {
+                        if let Some((g, e)) = read_session(&session_path) {
+                            if g != old && e > now_secs() {
                                 code = 0;
                                 generation = g;
                             }
@@ -211,8 +220,8 @@ pub async fn run(client: &reqwest::Client, tokens: &TokenManager, home: String, 
                 std::fs::remove_file(&path).ok();
             }
         }
-        let t = now();
-        if current_generation(&session_path).map(|(_, e)| e - t < 300).unwrap_or(true) && t - last_attempt > 60 {
+        let t = now_secs();
+        if read_session(&session_path).is_none_or(|(_, e)| e - t < 300) && t - last_attempt > 60 {
             last_attempt = t;
             renew("expiry").await;
         }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, IntoRawFd};
 use std::path::Path;
 use std::process::ExitCode;
@@ -30,6 +30,34 @@ fn make_temp_file(folder: &str) -> std::io::Result<std::fs::File> {
         tempfile()
     } else {
         tempfile_in(folder)
+    }
+}
+
+/// Fills `dst` with symlinks to `src` (relative to `root`), skipping the
+/// `.xodus*` bookkeeping entries and the lowercase relative paths in `decrypted`
+/// that already exist in `dst` as plaintext files. Directories containing such
+/// files are recreated and mirrored entry by entry instead of being linked.
+fn mirror_into_view(src: &Path, dst: &Path, root: &Path, decrypted: &HashSet<String>) {
+    let Ok(entries) = std::fs::read_dir(src) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with(".xodus") {
+            continue;
+        }
+        let path = entry.path();
+        let target = dst.join(&name);
+        let rel = path.strip_prefix(root).unwrap().to_string_lossy().to_ascii_lowercase();
+        if path.is_dir() {
+            let dir_prefix = format!("{rel}/");
+            if decrypted.iter().any(|d| d.starts_with(&dir_prefix)) {
+                std::fs::create_dir_all(&target).ok();
+                mirror_into_view(&path, &target, root, decrypted);
+            } else if !target.exists() {
+                std::os::unix::fs::symlink(&path, &target).ok();
+            }
+        } else if !decrypted.contains(&rel) && !target.exists() {
+            std::os::unix::fs::symlink(&path, &target).ok();
+        }
     }
 }
 
@@ -193,43 +221,21 @@ pub async fn run(
     // provides. Decrypted bytes only ever live on the RAM disk.
     if cfg!(target_os = "macos") && std::env::var_os("MACD2_VIEW").is_some() {
         let view = Path::new(&mount_dir).join("view");
-        let mut encrypted = std::collections::HashSet::new();
-        for file in &lfiles {
-            if !file.1.keep_encrypted {
+        let mut decrypted = HashSet::new();
+        for (path, segment) in &lfiles {
+            if !segment.keep_encrypted {
                 continue;
             }
-            let rel = file.0.trim_start_matches('\\').replace('\\', "/");
-            encrypted.insert(rel.to_ascii_lowercase());
+            let rel = path.trim_start_matches('\\').replace('\\', "/");
+            decrypted.insert(rel.to_ascii_lowercase());
             let dest = view.join(&rel);
             std::fs::create_dir_all(dest.parent().unwrap()).expect("view dir");
-            let mut out = File::from_std(std::fs::File::create(&dest).expect("view file"));
-            let mut i = File::open(out_absolute.join(&rel)).await.unwrap();
-            xvd.mount_mem_fd(&mut i, &mut out, file.1, *full_key, |_, _| {}).await.unwrap();
-        }
-        fn mirror(src: &Path, dst: &Path, root: &Path, skip: &std::collections::HashSet<String>) {
-            let Ok(entries) = std::fs::read_dir(src) else { return };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                if name.to_string_lossy().starts_with(".xodus") {
-                    continue;
-                }
-                let path = entry.path();
-                let target = dst.join(&name);
-                let rel = path.strip_prefix(root).unwrap().to_string_lossy().to_ascii_lowercase();
-                if path.is_dir() {
-                    if skip.iter().any(|s| s.starts_with(&format!("{rel}/"))) {
-                        std::fs::create_dir_all(&target).ok();
-                        mirror(&path, &target, root, skip);
-                    } else if !target.exists() {
-                        std::os::unix::fs::symlink(&path, &target).ok();
-                    }
-                } else if !skip.contains(&rel) && !target.exists() {
-                    std::os::unix::fs::symlink(&path, &target).ok();
-                }
-            }
+            let mut plain = File::from_std(std::fs::File::create(&dest).expect("view file"));
+            let mut source = File::open(out_absolute.join(&rel)).await.unwrap();
+            xvd.mount_mem_fd(&mut source, &mut plain, segment, *full_key, |_, _| {}).await.unwrap();
         }
         std::fs::create_dir_all(&view).ok();
-        mirror(&out_absolute, &view, &out_absolute, &encrypted);
+        mirror_into_view(&out_absolute, &view, &out_absolute, &decrypted);
         let entry_rel = exe
             .as_deref()
             .map(|e| e.trim_start_matches(['\\', '/']).replace('\\', "/"))
@@ -281,6 +287,7 @@ pub async fn run(
     let nt_prefix = nt_prefix.trim_end_matches('\\');
 
     let mut nt_entry = None;
+    let normalize_exe = |s: &str| s.trim_start_matches(['\\', '/']).replace('/', "\\").to_ascii_lowercase();
 
     for fd in fds {
         if !env_value.is_empty() {
@@ -290,8 +297,7 @@ pub async fn run(
         let nt_suffix = fd.0.trim_start_matches('\\');
         let nt_path = format!("\\??\\Z:{}\\{}", nt_prefix, nt_suffix);
         if let Some(exe) = &exe {
-            let norm = |s: &str| s.trim_start_matches(['\\', '/']).replace('/', "\\").to_ascii_lowercase();
-            if norm(exe) == norm(fd.0) {
+            if normalize_exe(exe) == normalize_exe(fd.0) {
                 nt_entry = Some(nt_path)
             }
         } else if nt_entry.is_none() {
