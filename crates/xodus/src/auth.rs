@@ -128,14 +128,20 @@ pub async fn do_sisu(
     )
     .await?;
 
-    let ExchangeUserTokenOutcome::Issued(
-        soap::BodyContent::RequestSecurityTokenResponseCollection(mut collection),
-    ) = user_token
-    else {
-        return Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            "error",
-        )));
+    let mut collection = match user_token {
+        ExchangeUserTokenOutcome::Issued(
+            soap::BodyContent::RequestSecurityTokenResponseCollection(collection),
+        ) => collection,
+        // Keep the sign-in-required vs. service-fault distinction for callers.
+        ExchangeUserTokenOutcome::Fault(pp) => {
+            return Err(Box::new(crate::tokens::session::fault(pp.as_ref())));
+        }
+        _ => {
+            return Err(Box::new(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "error",
+            )));
+        }
     };
 
     if let Some(sts) = collection.security_tokens.pop() {
@@ -181,8 +187,7 @@ pub async fn do_sisu(
         .await?;
     let resp = auth
         .sisu_authorize_rps(&user_token, &data.token, None)
-        .await
-        .expect("ok");
+        .await?;
     Ok((auth, resp, data))
 }
 

@@ -187,6 +187,10 @@ async fn main() -> ExitCode {
     }
     let client = reqwest::ClientBuilder::new()
         .user_agent(format!("xodus-cli/{}", env!("CARGO_PKG_VERSION")))
+        // Fail fast on unreachable hosts and notice dead connections; per-read
+        // stalls are bounded by the commands that stream (mac-fetch).
+        .connect_timeout(std::time::Duration::from_secs(15))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .unwrap();
     let args = CliArgs::parse();
@@ -208,9 +212,14 @@ async fn main() -> ExitCode {
     // matters in practice: on a session with no usable secret-service
     // keychain, provisioning fails outright, which previously meant even
     // these fully offline commands were unusable.
+    // MacSession renews the device identity itself so that it can report
+    // network failures (69) and keep --serve running instead of exiting 71.
     let needs_device_credentials = !matches!(
         args.command,
-        SubCommand::Clep { .. } | SubCommand::SpLicense { .. } | SubCommand::Logout { .. }
+        SubCommand::Clep { .. }
+            | SubCommand::SpLicense { .. }
+            | SubCommand::Logout { .. }
+            | SubCommand::MacSession { .. }
     );
     if needs_device_credentials {
         if xodus::tokens::device::ensure_device_credentials(&client, &tokens).await.is_err() {
