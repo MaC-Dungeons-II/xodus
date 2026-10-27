@@ -226,6 +226,17 @@ const NETWORK_WINDOW: Duration = Duration::from_secs(6 * 60);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// No response headers or no body bytes for this long fails the attempt.
 const STALL: Duration = Duration::from_secs(30);
+/// A connection still trickling bytes is not a stall, but one CDN edge can
+/// serve a connection at a few KB/s while the others run at full speed, and
+/// the download crawls until those chunks finish. After SLOW_GRACE, an
+/// attempt slower than both SLOW_FLOOR and 1/SLOW_RATIO of its fair share of
+/// the current total rate is dropped and retried at once on the next CDN
+/// root. A slow line slows every connection alike, so it never trips this.
+const SLOW_GRACE: Duration = Duration::from_secs(15);
+const SLOW_FLOOR: u64 = 1024 * 1024;
+const SLOW_RATIO: u64 = 5;
+/// Slow retries per chunk before it is left to finish at whatever speed.
+const SLOW_RETRIES: usize = 8;
 /// Chunks written between data syncs; their bitmap bytes are written only
 /// after the sync, so power loss can't mark unwritten data as finished.
 const SYNC_BATCH: usize = 8;
@@ -253,6 +264,8 @@ enum AttemptError {
     Network,
     /// Unexpected status, range or body size.
     Other,
+    /// Far slower than the other connections (see SLOW_GRACE).
+    Slow,
 }
 
 /// State shared by the download workers.
@@ -269,6 +282,8 @@ struct Download {
     total: u64,
     next: AtomicUsize,
     progress: AtomicU64,
+    /// Total download rate, bytes/s, smoothed by the progress reporter.
+    rate: AtomicU64,
     failed: AtomicBool,
     failure: AtomicU8,
     /// Chunks written but not yet synced/marked.
@@ -360,6 +375,7 @@ async fn download(
         total,
         next: AtomicUsize::new(0),
         progress: AtomicU64::new(finished_bytes),
+        rate: AtomicU64::new(0),
         failed: AtomicBool::new(false),
         failure: AtomicU8::new(FAIL_NONE),
         unflushed: Mutex::new(Vec::new()),
@@ -368,9 +384,19 @@ async fn download(
     let reporter = {
         let shared = shared.clone();
         tokio::spawn(async move {
+            let (mut last_bytes, mut last_time) = (shared.progress.load(Ordering::Relaxed), Instant::now());
             loop {
                 shared.report_progress();
                 tokio::time::sleep(Duration::from_millis(500)).await;
+                let (bytes, now) = (shared.progress.load(Ordering::Relaxed), Instant::now());
+                let dt = now.duration_since(last_time).as_secs_f64();
+                if dt > 0.0 {
+                    let sample = bytes.saturating_sub(last_bytes) as f64 / dt;
+                    let old = shared.rate.load(Ordering::Relaxed) as f64;
+                    let smoothed = if old == 0.0 { sample } else { old * 0.9 + sample * 0.1 };
+                    shared.rate.store(smoothed as u64, Ordering::Relaxed);
+                }
+                (last_bytes, last_time) = (bytes, now);
             }
         })
     };
@@ -439,7 +465,14 @@ impl Download {
 
     /// Fetches one chunk from `url`. Bytes received count towards progress
     /// as they arrive; `received` lets the caller roll them back on failure.
-    async fn fetch_chunk(&self, url: &str, start: u64, len: u64, received: &mut u64) -> Result<Vec<u8>, AttemptError> {
+    async fn fetch_chunk(
+        &self,
+        url: &str,
+        start: u64,
+        len: u64,
+        received: &mut u64,
+        check_slow: bool,
+    ) -> Result<Vec<u8>, AttemptError> {
         let end = start + len - 1;
         let request = self.client.get(url).header(reqwest::header::RANGE, format!("bytes={start}-{end}")).send();
         let response = match tokio::time::timeout(STALL, request).await {
@@ -463,7 +496,11 @@ impl Download {
         }
         let mut data = Vec::with_capacity(len as usize);
         let mut stream = response.bytes_stream();
+        let begun = Instant::now();
         loop {
+            if check_slow && self.too_slow(data.len() as u64, begun.elapsed()) {
+                return Err(AttemptError::Slow);
+            }
             let chunk = match tokio::time::timeout(STALL, stream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
                 Ok(None) => break,
@@ -481,6 +518,18 @@ impl Download {
             return Err(AttemptError::Network);
         }
         Ok(data)
+    }
+}
+
+impl Download {
+    /// This attempt, `bytes` in `elapsed`, is far behind the other connections.
+    fn too_slow(&self, bytes: u64, elapsed: Duration) -> bool {
+        if elapsed < SLOW_GRACE {
+            return false;
+        }
+        let own = (bytes as f64 / elapsed.as_secs_f64()) as u64;
+        let fair = self.rate.load(Ordering::Relaxed) / WORKERS as u64;
+        own < SLOW_FLOOR && own.saturating_mul(SLOW_RATIO) < fair
     }
 }
 
@@ -510,6 +559,7 @@ async fn download_worker(shared: Arc<Download>, worker: usize) {
         let mut other_failures = 0usize;
         let mut consecutive = 0u32;
         let mut attempt = 0usize;
+        let mut slow_retries = 0usize;
         loop {
             if shared.failed.load(Ordering::Relaxed) {
                 return;
@@ -517,7 +567,8 @@ async fn download_worker(shared: Arc<Download>, worker: usize) {
             let url = format!("{}{}", shared.roots[(worker + attempt) % shared.roots.len()], shared.relative_url);
             attempt += 1;
             let mut received = 0u64;
-            let error = match shared.fetch_chunk(&url, start, len, &mut received).await {
+            let check_slow = slow_retries < SLOW_RETRIES;
+            let error = match shared.fetch_chunk(&url, start, len, &mut received, check_slow).await {
                 Ok(data) => {
                     let written = shared.out.write_all_at(&data, start).and_then(|()| shared.chunk_written(index));
                     if let Err(err) = written {
@@ -529,6 +580,11 @@ async fn download_worker(shared: Arc<Download>, worker: usize) {
                 Err(error) => error,
             };
             shared.progress.fetch_sub(received, Ordering::Relaxed);
+            if matches!(error, AttemptError::Slow) {
+                // not a failure: straight to the next CDN root
+                slow_retries += 1;
+                continue;
+            }
             let since = *first_failure.get_or_insert_with(Instant::now);
             let give_up = match error {
                 AttemptError::Network => since.elapsed() >= NETWORK_WINDOW,
@@ -536,6 +592,7 @@ async fn download_worker(shared: Arc<Download>, worker: usize) {
                     other_failures += 1;
                     other_failures >= ATTEMPTS_PER_CHUNK
                 }
+                AttemptError::Slow => unreachable!(),
             };
             if give_up {
                 shared.fail(if matches!(error, AttemptError::Network) { FAIL_NETWORK } else { FAIL_CHUNK });
