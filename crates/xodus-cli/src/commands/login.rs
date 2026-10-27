@@ -42,6 +42,8 @@ fn failure_code(error: &(dyn std::error::Error + 'static)) -> u8 {
             RSTError::MissingNonce | RSTError::HmacKey | RSTError::Bergshamra(_)
                 | RSTError::InvalidResponseSignature(_) => 84,
             RSTError::InvalidResponse => 89,
+            RSTError::InvalidEncryptedPayload | RSTError::Decryption => 87,
+            RSTError::Utf8(_) => 88,
             RSTError::Response { step, .. } => match step {
                 ResponseStep::Size => 81,
                 ResponseStep::Encoding => 82,

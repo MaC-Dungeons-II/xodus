@@ -243,10 +243,14 @@ mod tests {
 
     fn pipe() -> (File, File) {
         let mut descriptors = [0; 2];
-        assert_eq!(
-            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) },
-            0
-        );
+        // pipe + fcntl: macOS has no pipe2
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        for fd in descriptors {
+            unsafe {
+                assert_ne!(libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK), -1);
+                assert_ne!(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC), -1);
+            }
+        }
         unsafe {
             (
                 File::from_raw_fd(descriptors[0]),
