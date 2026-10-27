@@ -7,6 +7,10 @@
 //!   bitmap[32], gamertag fields 4x128, auth headers 3x16384 (xboxlive,
 //!   minecraftservices, playfab), generation.
 //! Token values are written only to the private session file, never printed.
+//!
+//! With --check nothing is written: the account is signed in to the same
+//! Xbox services and only the outcome is reported (exit 0, 77 sign in again,
+//! 69 offline). The launcher uses that since its runtime signs in by itself.
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -300,7 +304,23 @@ fn still_being_written(meta: &std::fs::Metadata) -> bool {
     age < REQUEST_GRACE
 }
 
-pub async fn run(client: &reqwest::Client, tokens: &TokenManager, home: String, serve: bool) -> ExitCode {
+pub async fn run(client: &reqwest::Client, tokens: &TokenManager, home: String, serve: bool, check: bool) -> ExitCode {
+    if check {
+        let minted = std::panic::AssertUnwindSafe(mint(client, tokens))
+            .catch_unwind()
+            .await
+            .unwrap_or(Err(("panic", Failure::Other)));
+        return match minted {
+            Ok(s) => {
+                println!("{}", serde_json::json!({"session": "ready", "reason": "check", "expires": s.expires}));
+                ExitCode::SUCCESS
+            }
+            Err((stage, failure)) => {
+                println!("{}", serde_json::json!({"session": "failed", "stage": stage, "code": failure.code()}));
+                ExitCode::from(failure.code())
+            }
+        };
+    }
     let home = PathBuf::from(home);
     if let Err(err) = std::fs::create_dir_all(&home) {
         eprintln!("mac-session: cannot create session directory: {err}");

@@ -74,6 +74,8 @@ enum SubCommand {
         home: String,
         #[arg(long, default_value_t = false)]
         serve: bool,
+        #[arg(long, default_value_t = false, help = "Only check the sign-in; write no session file")]
+        check: bool,
     },
     #[command(about = "Download the full package without prompts and extract it (M(a)C Dungeons II launcher)")]
     MacFetch {
@@ -230,7 +232,7 @@ async fn main() -> ExitCode {
 
     let code = match args.command {
         SubCommand::StorePurchase | SubCommand::StoreWindowCheck { .. } => unreachable!(),
-        SubCommand::MacSession { home, serve } => commands::mac_session::run(&client, &tokens, home, serve).await,
+        SubCommand::MacSession { home, serve, check } => commands::mac_session::run(&client, &tokens, home, serve, check).await,
         SubCommand::MacFetch { product, workdir, destination, market } => {
             commands::mac_fetch::run(&client, &tokens, product, workdir, destination, market).await
         }
