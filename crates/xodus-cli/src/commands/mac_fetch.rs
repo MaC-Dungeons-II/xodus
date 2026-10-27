@@ -230,8 +230,10 @@ const STALL: Duration = Duration::from_secs(30);
 /// serve a connection at a few KB/s while the others run at full speed, and
 /// the download crawls until those chunks finish. After SLOW_GRACE, an
 /// attempt slower than both SLOW_FLOOR and 1/SLOW_RATIO of its fair share of
-/// the current total rate is dropped and retried at once on the next CDN
-/// root. A slow line slows every connection alike, so it never trips this.
+/// the best total rate seen so far is dropped and retried at once on the next
+/// CDN root. The best rate, not the current one: at the end only the slow
+/// connections are left and the current total is theirs. A line that is slow
+/// from the start never reaches a high best rate, so it never trips this.
 const SLOW_GRACE: Duration = Duration::from_secs(15);
 const SLOW_FLOOR: u64 = 1024 * 1024;
 const SLOW_RATIO: u64 = 5;
@@ -282,8 +284,8 @@ struct Download {
     total: u64,
     next: AtomicUsize,
     progress: AtomicU64,
-    /// Total download rate, bytes/s, smoothed by the progress reporter.
-    rate: AtomicU64,
+    /// Best smoothed total download rate so far, bytes/s (progress reporter).
+    peak_rate: AtomicU64,
     failed: AtomicBool,
     failure: AtomicU8,
     /// Chunks written but not yet synced/marked.
@@ -375,7 +377,7 @@ async fn download(
         total,
         next: AtomicUsize::new(0),
         progress: AtomicU64::new(finished_bytes),
-        rate: AtomicU64::new(0),
+        peak_rate: AtomicU64::new(0),
         failed: AtomicBool::new(false),
         failure: AtomicU8::new(FAIL_NONE),
         unflushed: Mutex::new(Vec::new()),
@@ -385,6 +387,7 @@ async fn download(
         let shared = shared.clone();
         tokio::spawn(async move {
             let (mut last_bytes, mut last_time) = (shared.progress.load(Ordering::Relaxed), Instant::now());
+            let mut rate = 0f64;
             loop {
                 shared.report_progress();
                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -392,9 +395,8 @@ async fn download(
                 let dt = now.duration_since(last_time).as_secs_f64();
                 if dt > 0.0 {
                     let sample = bytes.saturating_sub(last_bytes) as f64 / dt;
-                    let old = shared.rate.load(Ordering::Relaxed) as f64;
-                    let smoothed = if old == 0.0 { sample } else { old * 0.9 + sample * 0.1 };
-                    shared.rate.store(smoothed as u64, Ordering::Relaxed);
+                    rate = if rate == 0.0 { sample } else { rate * 0.9 + sample * 0.1 };
+                    shared.peak_rate.fetch_max(rate as u64, Ordering::Relaxed);
                 }
                 (last_bytes, last_time) = (bytes, now);
             }
@@ -528,7 +530,7 @@ impl Download {
             return false;
         }
         let own = (bytes as f64 / elapsed.as_secs_f64()) as u64;
-        let fair = self.rate.load(Ordering::Relaxed) / WORKERS as u64;
+        let fair = self.peak_rate.load(Ordering::Relaxed) / WORKERS as u64;
         own < SLOW_FLOOR && own.saturating_mul(SLOW_RATIO) < fair
     }
 }
